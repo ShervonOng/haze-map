@@ -1,0 +1,6 @@
+{
+  "name": "SG Haze Watch",
+  "description": "Live Singapore PSI & transboundary haze monitoring dashboard tracking air quality across North, South, East, West, and Central regions.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
