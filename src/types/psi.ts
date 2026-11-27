@@ -9,7 +9,7 @@ export type PsiBand =
   | 'Very Unhealthy'
   | 'Hazardous';
 
-export type HazeScenarioId = 'clear' | 'moderate' | 'transboundary' | 'severe';
+export type HazeScenarioId = 'live' | 'clear' | 'moderate' | 'transboundary' | 'severe';
 
 export type ChartMetricKey = 'psi24h' | 'pm25_1h' | 'pm10_24h';
 
@@ -57,6 +57,8 @@ export interface RegionTelemetry {
 export interface PsiSnapshot {
   scenarioId: HazeScenarioId;
   scenarioLabel: string;
+  isLive: boolean;
+  sourceLabel: string;
   updatedAtIso: string;
   updatedAtSgt: string;
   monsoonSeason: string;

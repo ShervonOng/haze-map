@@ -69,6 +69,8 @@ export const ORDERED_GEO_REGIONS: GeographicRegionId[] = [
   'east',
 ];
 
+type SimulationScenarioId = Exclude<HazeScenarioId, 'live'>;
+
 interface ScenarioTemplate {
   label: string;
   monsoonSeason: string;
@@ -83,7 +85,7 @@ interface ScenarioTemplate {
   humidityPct: number;
 }
 
-const SCENARIO_TEMPLATES: Record<HazeScenarioId, ScenarioTemplate> = {
+const SCENARIO_TEMPLATES: Record<SimulationScenarioId, ScenarioTemplate> = {
   clear: {
     label: 'Baseline Clear',
     monsoonSeason: 'Northeast Monsoon (Early Phase)',
@@ -138,6 +140,26 @@ const SCENARIO_TEMPLATES: Record<HazeScenarioId, ScenarioTemplate> = {
   },
 };
 
+interface ApiPsiItem {
+  date: string;
+  updatedTimestamp: string;
+  timestamp: string;
+  readings: Record<string, Record<string, number>>;
+}
+
+interface ApiPsiPayload {
+  ok: boolean;
+  source?: string;
+  fetchedAt?: string;
+  regionMetadata?: Array<{
+    name: string;
+    labelLocation: { latitude: number; longitude: number };
+  }>;
+  latest?: ApiPsiItem | null;
+  items?: ApiPsiItem[];
+  error?: string;
+}
+
 function formatSgtTime(date: Date): string {
   return new Intl.DateTimeFormat('en-SG', {
     timeZone: 'Asia/Singapore',
@@ -159,6 +181,25 @@ function formatHourLabel(date: Date): string {
   }).format(date);
 }
 
+function getSgtMonsoonLabel(date: Date): string {
+  const month = Number(
+    new Intl.DateTimeFormat('en-SG', {
+      timeZone: 'Asia/Singapore',
+      month: 'numeric',
+    }).format(date)
+  );
+  if (month >= 12 || month <= 3) return 'Northeast Monsoon Season';
+  if (month >= 6 && month <= 9) return 'Southwest Monsoon Season';
+  return 'Inter-Monsoon Period';
+}
+
+function estimateVisibilityKm(psi: number): number {
+  if (psi <= 50) return 11.5;
+  if (psi <= 100) return Number(Math.max(6.0, 11.5 - (psi - 50) * 0.1).toFixed(1));
+  if (psi <= 200) return Number(Math.max(2.4, 6.0 - (psi - 100) * 0.036).toFixed(1));
+  return Number(Math.max(0.8, 2.4 - (psi - 200) * 0.014).toFixed(1));
+}
+
 function buildTrendSeries(
   currentPsi: number,
   currentPm25: number,
@@ -173,7 +214,7 @@ function buildTrendSeries(
     const pointDate = new Date(now.getTime() - i * 3600 * 1000);
     const progress = (23 - i) / 23;
     const diurnalWave =
-      Math.sin((progress * Math.PI * 2) + seedOffset) * Math.max(2, currentPsi * 0.045);
+      Math.sin(progress * Math.PI * 2 + seedOffset) * Math.max(2, currentPsi * 0.045);
     const interpolatedPsi =
       i === 0
         ? currentPsi
@@ -199,7 +240,7 @@ function buildTrendSeries(
   return points;
 }
 
-function buildPollutants(
+function buildSimulatedPollutants(
   psi24h: number,
   pm25_1h: number,
   regionSeed: number
@@ -227,22 +268,181 @@ function buildPollutants(
   };
 }
 
-/**
- * Generates an NEA-compatible PSI snapshot for the selected haze scenario.
- *
- * API CONNECTION READY:
- * To connect live Singapore data later, replace the body of `fetchPsiSnapshot` with:
- *   const res = await fetch('https://api-open.data.gov.sg/v2/real-time/api/psi');
- *   const json = await res.json();
- * and map `json.data.items[0].readings` directly into `RegionTelemetry`.
- */
+function getDominantPollutant(r: PollutantReadings): 'PM2.5' | 'PM10' | 'O₃' | 'NO₂' {
+  const candidates: Array<{ name: 'PM2.5' | 'PM10' | 'O₃' | 'NO₂'; val: number }> = [
+    { name: 'PM2.5', val: r.pm25_sub_index },
+    { name: 'PM10', val: r.pm10_sub_index },
+    { name: 'O₃', val: r.o3_sub_index },
+    { name: 'NO₂', val: r.no2_one_hour_max },
+  ];
+  return candidates.sort((a, b) => b.val - a.val)[0].name;
+}
+
+export async function fetchLivePsiFromApi(): Promise<PsiSnapshot> {
+  const res = await fetch('/api/psi', {
+    method: 'GET',
+    headers: { Accept: 'application/json' },
+  });
+
+  const payload = (await res.json()) as ApiPsiPayload;
+  if (!res.ok || !payload.ok) {
+    throw new Error(payload.error || `API request failed (${res.status})`);
+  }
+
+  const items = payload.items && payload.items.length > 0
+    ? payload.items
+    : payload.latest
+    ? [payload.latest]
+    : [];
+
+  if (items.length === 0) {
+    throw new Error('No reading items returned by data.gov.sg PSI endpoint');
+  }
+
+  const latestItem = payload.latest ?? items[items.length - 1];
+  const updatedDate = new Date(latestItem.updatedTimestamp || latestItem.timestamp);
+  const metaCoords = new Map<string, { lat: number; lng: number }>();
+  for (const m of payload.regionMetadata ?? []) {
+    metaCoords.set(m.name, {
+      lat: m.labelLocation.latitude,
+      lng: m.labelLocation.longitude,
+    });
+  }
+
+  const regionEntries = {} as Record<RegionId, RegionTelemetry>;
+  const monsoonSeason = getSgtMonsoonLabel(updatedDate);
+  const isNeMonsoon = monsoonSeason.startsWith('Northeast');
+  const windCardinal = isNeMonsoon ? 'NNE' : 'SW';
+  const windDirectionDeg = isNeMonsoon ? 25 : 225;
+  const windSpeedKmh = isNeMonsoon ? 15 : 13;
+
+  ORDERED_GEO_REGIONS.forEach((geoId, idx) => {
+    const cfg = SINGAPORE_REGIONS[geoId];
+    const r = latestItem.readings;
+    const psi24 = Math.round(r.psi_twenty_four_hourly?.[geoId] ?? 0);
+    const pm25_24 = Math.round(r.pm25_twenty_four_hourly?.[geoId] ?? 0);
+    const pm10_24 = Math.round(r.pm10_twenty_four_hourly?.[geoId] ?? 0);
+    const pm25_sub = Math.round(r.pm25_sub_index?.[geoId] ?? psi24);
+    const pm10_sub = Math.round(r.pm10_sub_index?.[geoId] ?? pm10_24);
+    const o3_sub = Math.round(r.o3_sub_index?.[geoId] ?? 0);
+    const co_sub = Math.round(r.co_sub_index?.[geoId] ?? 0);
+    const so2_sub = Math.round(r.so2_sub_index?.[geoId] ?? 0);
+    const no2_1h = Math.round(r.no2_one_hour_max?.[geoId] ?? 0);
+
+    const readings: PollutantReadings = {
+      psi_twenty_four_hourly: psi24,
+      pm25_twenty_four_hourly: pm25_24,
+      // data.gov.sg /psi exposes 24h PM2.5; approximate 1h equivalent when /pm25 isn't queried separately
+      pm25_one_hourly: pm25_24,
+      pm10_twenty_four_hourly: pm10_24,
+      pm25_sub_index: pm25_sub,
+      pm10_sub_index: pm10_sub,
+      o3_sub_index: o3_sub,
+      co_sub_index: co_sub,
+      so2_sub_index: so2_sub,
+      no2_one_hour_max: no2_1h,
+    };
+
+    const trend24h: HourlyTrendPoint[] = items.map((item) => {
+      const ptDate = new Date(item.timestamp);
+      const ptPsi = Math.round(item.readings.psi_twenty_four_hourly?.[geoId] ?? psi24);
+      const ptPm25 = Math.round(item.readings.pm25_twenty_four_hourly?.[geoId] ?? pm25_24);
+      const ptPm10 = Math.round(item.readings.pm10_twenty_four_hourly?.[geoId] ?? pm10_24);
+      return {
+        timestamp: item.timestamp,
+        label: formatHourLabel(ptDate),
+        psi24h: ptPsi,
+        pm25_1h: ptPm25,
+        pm10_24h: ptPm10,
+      };
+    });
+
+    const earliestPsi = trend24h[0]?.psi24h ?? psi24;
+    const delta24h = psi24 - earliestPsi;
+
+    regionEntries[geoId] = {
+      ...cfg,
+      coordinates: metaCoords.get(geoId) ?? cfg.coordinates,
+      readings,
+      delta24h,
+      dominantPollutant: getDominantPollutant(readings),
+      windDirectionDeg: windDirectionDeg + (idx - 2) * 3,
+      windCardinal,
+      windSpeedKmh,
+      visibilityKm: estimateVisibilityKm(psi24),
+      humidityPct: 76,
+      trend24h,
+    };
+  });
+
+  const geoList = ORDERED_GEO_REGIONS.map((id) => regionEntries[id]);
+  const avg = (fn: (r: RegionTelemetry) => number) =>
+    Math.round(geoList.reduce((acc, r) => acc + fn(r), 0) / geoList.length);
+  const maxPsi = Math.max(...geoList.map((r) => r.readings.psi_twenty_four_hourly));
+
+  const nationalTrend: HourlyTrendPoint[] = geoList[0].trend24h.map((pt, hourIdx) => ({
+    timestamp: pt.timestamp,
+    label: pt.label,
+    psi24h: Math.round(
+      geoList.reduce((acc, r) => acc + r.trend24h[hourIdx].psi24h, 0) / geoList.length
+    ),
+    pm25_1h: Math.round(
+      geoList.reduce((acc, r) => acc + r.trend24h[hourIdx].pm25_1h, 0) / geoList.length
+    ),
+    pm10_24h: Math.round(
+      geoList.reduce((acc, r) => acc + r.trend24h[hourIdx].pm10_24h, 0) / geoList.length
+    ),
+  }));
+
+  const nationalReadings: PollutantReadings = {
+    psi_twenty_four_hourly: maxPsi,
+    pm25_twenty_four_hourly: avg((r) => r.readings.pm25_twenty_four_hourly),
+    pm25_one_hourly: avg((r) => r.readings.pm25_one_hourly),
+    pm10_twenty_four_hourly: avg((r) => r.readings.pm10_twenty_four_hourly),
+    pm25_sub_index: Math.max(...geoList.map((r) => r.readings.pm25_sub_index)),
+    pm10_sub_index: avg((r) => r.readings.pm10_sub_index),
+    o3_sub_index: avg((r) => r.readings.o3_sub_index),
+    co_sub_index: avg((r) => r.readings.co_sub_index),
+    so2_sub_index: avg((r) => r.readings.so2_sub_index),
+    no2_one_hour_max: avg((r) => r.readings.no2_one_hour_max),
+  };
+
+  regionEntries.national = {
+    ...SINGAPORE_REGIONS.national,
+    readings: nationalReadings,
+    delta24h: avg((r) => r.delta24h),
+    dominantPollutant: getDominantPollutant(nationalReadings),
+    windDirectionDeg,
+    windCardinal,
+    windSpeedKmh,
+    visibilityKm: estimateVisibilityKm(maxPsi),
+    humidityPct: 76,
+    trend24h: nationalTrend,
+  };
+
+  return {
+    scenarioId: 'live',
+    scenarioLabel: 'Live NEA Feed',
+    isLive: true,
+    sourceLabel: 'data.gov.sg · NEA Real-Time PSI',
+    updatedAtIso: updatedDate.toISOString(),
+    updatedAtSgt: `${formatSgtTime(updatedDate)} SGT`,
+    monsoonSeason,
+    windSummary: `Live readings synced from Singapore NEA via /api/psi (${items.length} hourly points)`,
+    regions: regionEntries,
+  };
+}
+
 export async function fetchPsiSnapshot(
   scenarioId: HazeScenarioId,
   jitter = false
 ): Promise<PsiSnapshot> {
+  if (scenarioId === 'live') {
+    return fetchLivePsiFromApi();
+  }
+
   const template = SCENARIO_TEMPLATES[scenarioId];
   const now = new Date();
-
   const regionEntries = {} as Record<RegionId, RegionTelemetry>;
 
   ORDERED_GEO_REGIONS.forEach((geoId, idx) => {
@@ -253,13 +453,13 @@ export async function fetchPsiSnapshot(
     const psi24h = Math.max(14, template.basePsi[geoId] + psiJitter);
     const pm25_1h = Math.max(6, template.basePm25_1h[geoId] + pmJitter);
     const delta = template.delta24h[geoId];
-    const readings = buildPollutants(psi24h, pm25_1h, idx * 2);
+    const readings = buildSimulatedPollutants(psi24h, pm25_1h, idx * 2);
 
     regionEntries[geoId] = {
       ...cfg,
       readings,
       delta24h: delta,
-      dominantPollutant: psi24h >= 50 ? 'PM2.5' : 'PM2.5',
+      dominantPollutant: getDominantPollutant(readings),
       windDirectionDeg: template.windDirectionDeg + (idx - 2) * 4,
       windCardinal: template.windCardinal,
       windSpeedKmh: Math.max(3, template.windSpeedKmh + (idx % 3) - 1),
@@ -269,7 +469,6 @@ export async function fetchPsiSnapshot(
     };
   });
 
-  // Compute National composite (following NEA convention: max/mean summary across 5 regions)
   const geoList = ORDERED_GEO_REGIONS.map((id) => regionEntries[id]);
   const avg = (fn: (r: RegionTelemetry) => number) =>
     Math.round(geoList.reduce((acc, r) => acc + fn(r), 0) / geoList.length);
@@ -277,42 +476,38 @@ export async function fetchPsiSnapshot(
   const avgPm25_1h = avg((r) => r.readings.pm25_one_hourly);
   const avgDelta = avg((r) => r.delta24h);
 
-  const nationalTrend: HourlyTrendPoint[] = geoList[0].trend24h.map((_, hourIdx) => {
-    const point = geoList[0].trend24h[hourIdx];
-    const meanPsi = Math.round(
+  const nationalTrend: HourlyTrendPoint[] = geoList[0].trend24h.map((pt, hourIdx) => ({
+    timestamp: pt.timestamp,
+    label: pt.label,
+    psi24h: Math.round(
       geoList.reduce((acc, r) => acc + r.trend24h[hourIdx].psi24h, 0) / geoList.length
-    );
-    const meanPm25 = Math.round(
+    ),
+    pm25_1h: Math.round(
       geoList.reduce((acc, r) => acc + r.trend24h[hourIdx].pm25_1h, 0) / geoList.length
-    );
-    const meanPm10 = Math.round(
+    ),
+    pm10_24h: Math.round(
       geoList.reduce((acc, r) => acc + r.trend24h[hourIdx].pm10_24h, 0) / geoList.length
-    );
-    return {
-      timestamp: point.timestamp,
-      label: point.label,
-      psi24h: meanPsi,
-      pm25_1h: meanPm25,
-      pm10_24h: meanPm10,
-    };
-  });
+    ),
+  }));
+
+  const nationalReadings: PollutantReadings = {
+    psi_twenty_four_hourly: maxPsi,
+    pm25_twenty_four_hourly: avg((r) => r.readings.pm25_twenty_four_hourly),
+    pm25_one_hourly: avgPm25_1h,
+    pm10_twenty_four_hourly: avg((r) => r.readings.pm10_twenty_four_hourly),
+    pm25_sub_index: maxPsi,
+    pm10_sub_index: avg((r) => r.readings.pm10_sub_index),
+    o3_sub_index: avg((r) => r.readings.o3_sub_index),
+    co_sub_index: avg((r) => r.readings.co_sub_index),
+    so2_sub_index: avg((r) => r.readings.so2_sub_index),
+    no2_one_hour_max: avg((r) => r.readings.no2_one_hour_max),
+  };
 
   regionEntries.national = {
     ...SINGAPORE_REGIONS.national,
-    readings: {
-      psi_twenty_four_hourly: maxPsi,
-      pm25_twenty_four_hourly: avg((r) => r.readings.pm25_twenty_four_hourly),
-      pm25_one_hourly: avgPm25_1h,
-      pm10_twenty_four_hourly: avg((r) => r.readings.pm10_twenty_four_hourly),
-      pm25_sub_index: maxPsi,
-      pm10_sub_index: avg((r) => r.readings.pm10_sub_index),
-      o3_sub_index: avg((r) => r.readings.o3_sub_index),
-      co_sub_index: avg((r) => r.readings.co_sub_index),
-      so2_sub_index: avg((r) => r.readings.so2_sub_index),
-      no2_one_hour_max: avg((r) => r.readings.no2_one_hour_max),
-    },
+    readings: nationalReadings,
     delta24h: avgDelta,
-    dominantPollutant: 'PM2.5',
+    dominantPollutant: getDominantPollutant(nationalReadings),
     windDirectionDeg: template.windDirectionDeg,
     windCardinal: template.windCardinal,
     windSpeedKmh: template.windSpeedKmh,
@@ -326,6 +521,8 @@ export async function fetchPsiSnapshot(
   return {
     scenarioId,
     scenarioLabel: template.label,
+    isLive: false,
+    sourceLabel: `Scenario Simulation (${template.label})`,
     updatedAtIso: now.toISOString(),
     updatedAtSgt: `${formatSgtTime(now)} SGT`,
     monsoonSeason: template.monsoonSeason,
